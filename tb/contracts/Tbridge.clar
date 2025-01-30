@@ -1,116 +1,82 @@
-;; PayBridge v2.0 - Enhanced Payment Protocol with Verification
-;; Secure P2P payments with verification steps and improved tracking
+;; PayBridge v3.0 - Advanced Payment Protocol with Trust System
 
-(define-constant CONTRACT-OWNER tx-sender)
-(define-constant ERR-NO-AUTH (err u1))
-(define-constant ERR-LOW-VALUE (err u2))
-(define-constant ERR-INVALID-USER (err u3))
-(define-constant ERR-NO-PAYMENT (err u4))
-(define-constant ERR-WRONG-STATE (err u5))
-(define-constant ERR-EXPIRED (err u6))
-
-;; Payment states
-(define-constant STATE-PENDING "pending")
-(define-constant STATE-VERIFIED "verified")
-(define-constant STATE-COMPLETED "completed")
-(define-constant STATE-CANCELLED "cancelled")
-
-;; Enhanced payment storage
-(define-map payments 
-  { id: uint }
-  {
-    from: principal,
-    to: principal,
-    amount: uint,
-    status: (string-ascii 10),
-    created-at: uint,
-    verified-at: uint,
-    completed-at: uint,
-    verification-code: uint
-  }
-)
-
-;; User activity tracking
-(define-map user-stats 
-  { user: principal }
-  {
-    total-payments: uint,
-    total-volume: uint,
-    completed-count: uint
-  }
-)
-
-;; Payment counter
-(define-data-var payment-id-counter uint u1)
-
-;; Check if user is valid
-(define-private (is-valid-user (user principal))
-  (and 
-    (not (is-eq user tx-sender))
-    (not (is-eq user CONTRACT-OWNER))
-  )
-)
-
-;; Generate verification code
-(define-private (generate-code)
-  (mod (+ block-height (var-get payment-id-counter)) u1000000)
-)
-
-;; Create new payment
-(define-public (create-payment 
-  (recipient principal) 
-  (amount uint)
-)
-  (begin
-    (asserts! (is-valid-user recipient) ERR-INVALID-USER)
-    (asserts! (> amount u0) ERR-LOW-VALUE)
-    
-    (let 
-      (
-        (id (var-get payment-id-counter))
-        (code (generate-code))
+        ))
       )
-      (var-set payment-id-counter (+ id u1))
-      
-      (map-set payments 
-        { id: id }
-        {
-          from: tx-sender,
-          to: recipient,
-          amount: amount,
-          status: STATE-PENDING,
-          created-at: block-height,
-          verified-at: u0,
-          completed-at: u0,
-          verification-code: code
-        }
+      (map-set user-profiles 
+        { user: tx-sender }
+        (merge sender-profile
+          {
+            total-payments: (+ (get total-payments sender-profile) u1),
+            total-volume: (+ (get total-volume sender-profile) (get amount payment)),
+            completed-count: (+ (get completed-count sender-profile) u1)
+          }
+        )
       )
-      
-      (ok id)
     )
+    
+    (ok true)
   )
 )
 
-;; Verify payment
-(define-public (verify-payment 
+;; Rate completed payment
+(define-public (rate-payment 
   (payment-id uint)
-  (code uint)
+  (rating uint)
+  (feedback (string-ascii 50))
 )
   (let 
     (
       (payment (unwrap! (map-get? payments { id: payment-id }) ERR-NO-PAYMENT))
     )
     (asserts! (is-eq tx-sender (get to payment)) ERR-NO-AUTH)
-    (asserts! (is-eq (get status payment) STATE-PENDING) ERR-WRONG-STATE)
-    (asserts! (is-eq code (get verification-code payment)) ERR-NO-AUTH)
+    (asserts! (is-eq (get status payment) STATE-COMPLETED) ERR-WRONG-STATE)
+    (asserts! (is-eq (get rating payment) u0) ERR-ALREADY-RATED)
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR-LOW-RATING)
     
+    ;; Update payment rating
     (map-set payments 
       { id: payment-id }
       (merge payment 
         { 
-          status: STATE-VERIFIED,
-          verified-at: block-height
+          rating: rating,
+          feedback: feedback
         }
+      )
+    )
+    
+    ;; Update sender profile
+    (let
+      (
+        (sender-profile (default-to
+          { 
+            total-payments: u0, 
+            total-volume: u0, 
+            completed-count: u0,
+            trust-score: u50,
+            rating-sum: u0,
+            rating-count: u0,
+            disputed-count: u0,
+            resolved-count: u0
+          }
+          (map-get? user-profiles { user: (get from payment) })
+        ))
+        (new-rating-sum (+ (get rating-sum sender-profile) rating))
+        (new-rating-count (+ (get rating-count sender-profile) u1))
+      )
+      (map-set user-profiles 
+        { user: (get from payment) }
+        (merge sender-profile
+          {
+            rating-sum: new-rating-sum,
+            rating-count: new-rating-count,
+            trust-score: (calculate-trust-score (merge sender-profile 
+              {
+                rating-sum: new-rating-sum,
+                rating-count: new-rating-count
+              }
+            ))
+          }
+        )
       )
     )
     
@@ -118,47 +84,70 @@
   )
 )
 
-;; Complete payment
-(define-public (complete-payment (payment-id uint))
+;; File dispute
+(define-public (file-dispute
+  (payment-id uint)
+  (reason (string-ascii 100))
+)
   (let 
     (
       (payment (unwrap! (map-get? payments { id: payment-id }) ERR-NO-PAYMENT))
     )
-    (asserts! (is-eq tx-sender (get from payment)) ERR-NO-AUTH)
-    (asserts! (is-eq (get status payment) STATE-VERIFIED) ERR-WRONG-STATE)
-    
-    (try! (stx-transfer? 
-      (get amount payment) 
-      tx-sender 
-      (get to payment)
-    ))
+    (asserts! 
+      (or 
+        (is-eq tx-sender (get from payment))
+        (is-eq tx-sender (get to payment))
+      )
+      ERR-NO-AUTH
+    )
+    (asserts! 
+      (or
+        (is-eq (get status payment) STATE-PENDING)
+        (is-eq (get status payment) STATE-VERIFIED)
+      )
+      ERR-WRONG-STATE
+    )
     
     ;; Update payment status
     (map-set payments 
       { id: payment-id }
       (merge payment 
         { 
-          status: STATE-COMPLETED,
-          completed-at: block-height
+          status: STATE-DISPUTED,
+          dispute-reason: reason
         }
       )
     )
     
-    ;; Update user stats
+    ;; Update profiles
     (let
       (
-        (sender-stats (default-to
-          { total-payments: u0, total-volume: u0, completed-count: u0 }
-          (map-get? user-stats { user: tx-sender })
+        (sender-profile (default-to
+          { 
+            total-payments: u0, 
+            total-volume: u0, 
+            completed-count: u0,
+            trust-score: u50,
+            rating-sum: u0,
+            rating-count: u0,
+            disputed-count: u0,
+            resolved-count: u0
+          }
+          (map-get? user-profiles { user: (get from payment) })
         ))
       )
-      (map-set user-stats 
-        { user: tx-sender }
-        {
-          total-payments: (+ (get total-payments sender-stats) u1),
-          total-volume: (+ (get total-volume sender-stats) (get amount payment)),
-          completed-count: (+ (get completed-count sender-stats) u1)
-        }
+      (map-set user-profiles 
+        { user: (get from payment) }
+        (merge sender-profile
+          {
+            disputed-count: (+ (get disputed-count sender-profile) u1),
+            trust-score: (calculate-trust-score (merge sender-profile 
+              {
+                disputed-count: (+ (get disputed-count sender-profile) u1)
+              }
+            ))
+          }
+        )
       )
     )
     
@@ -166,15 +155,88 @@
   )
 )
 
-;; Get payment details
+;; Resolve dispute (admin only)
+(define-public (resolve-dispute
+  (payment-id uint)
+  (resolution (string-ascii 100))
+  (refund bool)
+)
+  (let 
+    (
+      (payment (unwrap! (map-get? payments { id: payment-id }) ERR-NO-PAYMENT))
+    )
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NO-AUTH)
+    (asserts! (is-eq (get status payment) STATE-DISPUTED) ERR-NO-DISPUTE)
+    
+    ;; Process refund if needed
+    (if refund
+      (try! (stx-transfer? 
+        (get amount payment) 
+        (get to payment) 
+        (get from payment)
+      ))
+      true
+    )
+    
+    ;; Update payment status
+    (map-set payments 
+      { id: payment-id }
+      (merge payment 
+        { 
+          status: (if refund STATE-CANCELLED STATE-RESOLVED),
+          resolution: resolution
+        }
+      )
+    )
+    
+    ;; Update profile
+    (let
+      (
+        (sender-profile (default-to
+          { 
+            total-payments: u0, 
+            total-volume: u0, 
+            completed-count: u0,
+            trust-score: u50,
+            rating-sum: u0,
+            rating-count: u0,
+            disputed-count: u0,
+            resolved-count: u0
+          }
+          (map-get? user-profiles { user: (get from payment) })
+        ))
+      )
+      (map-set user-profiles 
+        { user: (get from payment) }
+        (merge sender-profile
+          {
+            resolved-count: (+ (get resolved-count sender-profile) u1)
+          }
+        )
+      )
+    )
+    
+    (ok true)
+  )
+)
+
+;; Read-only functions
 (define-read-only (get-payment-info (payment-id uint))
   (map-get? payments { id: payment-id })
 )
 
-;; Get user statistics
-(define-read-only (get-user-stats (user principal))
+(define-read-only (get-user-profile (user principal))
   (default-to
-    { total-payments: u0, total-volume: u0, completed-count: u0 }
-    (map-get? user-stats { user: user })
+    { 
+      total-payments: u0, 
+      total-volume: u0, 
+      completed-count: u0,
+      trust-score: u50,
+      rating-sum: u0,
+      rating-count: u0,
+      disputed-count: u0,
+      resolved-count: u0
+    }
+    (map-get? user-profiles { user: user })
   )
 )
