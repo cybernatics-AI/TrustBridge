@@ -1,242 +1,195 @@
-;; PayBridge v3.0 - Advanced Payment Protocol with Trust System
+;; TrustBridge: P2P Trust and Payment Protocol
 
-        ))
-      )
-      (map-set user-profiles 
-        { user: tx-sender }
-        (merge sender-profile
-          {
-            total-payments: (+ (get total-payments sender-profile) u1),
-            total-volume: (+ (get total-volume sender-profile) (get amount payment)),
-            completed-count: (+ (get completed-count sender-profile) u1)
-          }
-        )
-      )
-    )
-    
-    (ok true)
+(define-constant ADMIN tx-sender)
+(define-constant ERR-NOT-AUTHORIZED (err u100))
+(define-constant ERR-ZERO-AMOUNT (err u101))
+(define-constant ERR-SELF-DEAL (err u102))
+(define-constant ERR-DEAL-NOT-EXIST (err u103))
+(define-constant ERR-BAD-RATING (err u104))
+(define-constant ERR-INVALID-DEAL-ID (err u105))
+
+;; Check if deal parties are different
+(define-private (validate-counterparty (counterparty principal))
+  (and 
+    (not (is-eq counterparty tx-sender))
+    (not (is-eq counterparty ADMIN))
   )
 )
 
-;; Rate completed payment
-(define-public (rate-payment 
-  (payment-id uint)
-  (rating uint)
-  (feedback (string-ascii 50))
+;; Validate deal existence
+(define-private (validate-deal-id (deal-id uint))
+  (and 
+    (> deal-id u0)
+    (< deal-id (var-get deal-counter))
+  )
 )
-  (let 
-    (
-      (payment (unwrap! (map-get? payments { id: payment-id }) ERR-NO-PAYMENT))
-    )
-    (asserts! (is-eq tx-sender (get to payment)) ERR-NO-AUTH)
-    (asserts! (is-eq (get status payment) STATE-COMPLETED) ERR-WRONG-STATE)
-    (asserts! (is-eq (get rating payment) u0) ERR-ALREADY-RATED)
-    (asserts! (and (>= rating u1) (<= rating u5)) ERR-LOW-RATING)
+
+;; Deal storage
+(define-map deals 
+  { deal-id: uint }
+  {
+    initiator: principal,
+    counterparty: principal,
+    value: uint,
+    state: (string-ascii 20),
+    timestamp: uint,
+    trust-score: uint
+  }
+)
+
+;; Trust profiles
+(define-map trust-profiles 
+  { address: principal }
+  { cumulative-score: uint, deal-count: uint }
+)
+
+;; Deal counter
+(define-data-var deal-counter uint u1)
+
+;; Initiate new deal
+(define-public (initiate-deal 
+  (counterparty principal) 
+  (value uint)
+)
+  (begin
+    ;; Validate counterparty
+    (asserts! (validate-counterparty counterparty) ERR-SELF-DEAL)
     
-    ;; Update payment rating
-    (map-set payments 
-      { id: payment-id }
-      (merge payment 
-        { 
-          rating: rating,
-          feedback: feedback
+    ;; Validate value
+    (asserts! (> value u0) ERR-ZERO-AMOUNT)
+    
+    (let 
+      (
+        (current-deal-id (var-get deal-counter))
+      )
+      ;; Update deal counter
+      (var-set deal-counter (+ current-deal-id u1))
+      
+      ;; Record deal
+      (map-set deals 
+        { deal-id: current-deal-id }
+        {
+          initiator: tx-sender,
+          counterparty: counterparty,
+          value: value,
+          state: "OPEN",
+          timestamp: block-height,
+          trust-score: u0
         }
       )
+      
+      (ok current-deal-id)
     )
-    
-    ;; Update sender profile
-    (let
-      (
-        (sender-profile (default-to
-          { 
-            total-payments: u0, 
-            total-volume: u0, 
-            completed-count: u0,
-            trust-score: u50,
-            rating-sum: u0,
-            rating-count: u0,
-            disputed-count: u0,
-            resolved-count: u0
-          }
-          (map-get? user-profiles { user: (get from payment) })
-        ))
-        (new-rating-sum (+ (get rating-sum sender-profile) rating))
-        (new-rating-count (+ (get rating-count sender-profile) u1))
-      )
-      (map-set user-profiles 
-        { user: (get from payment) }
-        (merge sender-profile
-          {
-            rating-sum: new-rating-sum,
-            rating-count: new-rating-count,
-            trust-score: (calculate-trust-score (merge sender-profile 
-              {
-                rating-sum: new-rating-sum,
-                rating-count: new-rating-count
-              }
-            ))
-          }
-        )
-      )
-    )
-    
-    (ok true)
   )
 )
 
-;; File dispute
-(define-public (file-dispute
-  (payment-id uint)
-  (reason (string-ascii 100))
-)
-  (let 
-    (
-      (payment (unwrap! (map-get? payments { id: payment-id }) ERR-NO-PAYMENT))
-    )
-    (asserts! 
-      (or 
-        (is-eq tx-sender (get from payment))
-        (is-eq tx-sender (get to payment))
-      )
-      ERR-NO-AUTH
-    )
-    (asserts! 
-      (or
-        (is-eq (get status payment) STATE-PENDING)
-        (is-eq (get status payment) STATE-VERIFIED)
-      )
-      ERR-WRONG-STATE
-    )
+;; Complete deal payment
+(define-public (complete-payment (deal-id uint))
+  (begin
+    ;; Validate deal
+    (asserts! (validate-deal-id deal-id) ERR-INVALID-DEAL-ID)
     
-    ;; Update payment status
-    (map-set payments 
-      { id: payment-id }
-      (merge payment 
-        { 
-          status: STATE-DISPUTED,
-          dispute-reason: reason
-        }
-      )
-    )
-    
-    ;; Update profiles
-    (let
+    (let 
       (
-        (sender-profile (default-to
-          { 
-            total-payments: u0, 
-            total-volume: u0, 
-            completed-count: u0,
-            trust-score: u50,
-            rating-sum: u0,
-            rating-count: u0,
-            disputed-count: u0,
-            resolved-count: u0
-          }
-          (map-get? user-profiles { user: (get from payment) })
+        (deal (unwrap! 
+          (map-get? deals { deal-id: deal-id }) 
+          ERR-DEAL-NOT-EXIST
         ))
       )
-      (map-set user-profiles 
-        { user: (get from payment) }
-        (merge sender-profile
-          {
-            disputed-count: (+ (get disputed-count sender-profile) u1),
-            trust-score: (calculate-trust-score (merge sender-profile 
-              {
-                disputed-count: (+ (get disputed-count sender-profile) u1)
-              }
-            ))
-          }
-        )
+      ;; Verify initiator
+      (asserts! 
+        (is-eq tx-sender (get initiator deal)) 
+        ERR-NOT-AUTHORIZED
       )
-    )
-    
-    (ok true)
-  )
-)
-
-;; Resolve dispute (admin only)
-(define-public (resolve-dispute
-  (payment-id uint)
-  (resolution (string-ascii 100))
-  (refund bool)
-)
-  (let 
-    (
-      (payment (unwrap! (map-get? payments { id: payment-id }) ERR-NO-PAYMENT))
-    )
-    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NO-AUTH)
-    (asserts! (is-eq (get status payment) STATE-DISPUTED) ERR-NO-DISPUTE)
-    
-    ;; Process refund if needed
-    (if refund
+      
+      ;; Process payment
       (try! (stx-transfer? 
-        (get amount payment) 
-        (get to payment) 
-        (get from payment)
+        (get value deal) 
+        tx-sender 
+        (get counterparty deal)
       ))
-      true
+      
+      ;; Update deal state
+      (map-set deals 
+        { deal-id: deal-id }
+        (merge deal { state: "FULFILLED" })
+      )
+      
+      (ok true)
     )
+  )
+)
+
+;; Add trust rating
+(define-public (rate-counterparty 
+  (deal-id uint) 
+  (rating uint)
+)
+  (begin
+    ;; Validate deal
+    (asserts! (validate-deal-id deal-id) ERR-INVALID-DEAL-ID)
     
-    ;; Update payment status
-    (map-set payments 
-      { id: payment-id }
-      (merge payment 
-        { 
-          status: (if refund STATE-CANCELLED STATE-RESOLVED),
-          resolution: resolution
+    (let 
+      (
+        (deal (unwrap! 
+          (map-get? deals { deal-id: deal-id }) 
+          ERR-DEAL-NOT-EXIST
+        ))
+        (initiator (get initiator deal))
+        (counterparty (get counterparty deal))
+      )
+      ;; Verify rater
+      (asserts! 
+        (is-eq tx-sender counterparty) 
+        ERR-NOT-AUTHORIZED
+      )
+      (asserts! (> rating u0) ERR-BAD-RATING)
+      
+      ;; Update trust profile
+      (map-set trust-profiles 
+        { address: initiator }
+        {
+          cumulative-score: (+ 
+            (get cumulative-score 
+              (default-to 
+                { cumulative-score: u0, deal-count: u0 } 
+                (map-get? trust-profiles { address: initiator })
+              )
+            )
+            rating
+          ),
+          deal-count: (+ 
+            (get deal-count 
+              (default-to 
+                { cumulative-score: u0, deal-count: u0 } 
+                (map-get? trust-profiles { address: initiator })
+              )
+            )
+            u1
+          )
         }
       )
-    )
-    
-    ;; Update profile
-    (let
-      (
-        (sender-profile (default-to
-          { 
-            total-payments: u0, 
-            total-volume: u0, 
-            completed-count: u0,
-            trust-score: u50,
-            rating-sum: u0,
-            rating-count: u0,
-            disputed-count: u0,
-            resolved-count: u0
-          }
-          (map-get? user-profiles { user: (get from payment) })
-        ))
+      
+      ;; Update deal rating
+      (map-set deals 
+        { deal-id: deal-id }
+        (merge deal { trust-score: rating })
       )
-      (map-set user-profiles 
-        { user: (get from payment) }
-        (merge sender-profile
-          {
-            resolved-count: (+ (get resolved-count sender-profile) u1)
-          }
-        )
-      )
+      
+      (ok true)
     )
-    
-    (ok true)
   )
 )
 
-;; Read-only functions
-(define-read-only (get-payment-info (payment-id uint))
-  (map-get? payments { id: payment-id })
+;; Query trust profile
+(define-read-only (get-trust-profile (address principal))
+  (default-to 
+    { cumulative-score: u0, deal-count: u0 }
+    (map-get? trust-profiles { address: address })
+  )
 )
 
-(define-read-only (get-user-profile (user principal))
-  (default-to
-    { 
-      total-payments: u0, 
-      total-volume: u0, 
-      completed-count: u0,
-      trust-score: u50,
-      rating-sum: u0,
-      rating-count: u0,
-      disputed-count: u0,
-      resolved-count: u0
-    }
-    (map-get? user-profiles { user: user })
-  )
+;; Query deal information
+(define-read-only (get-deal-info (deal-id uint))
+  (map-get? deals { deal-id: deal-id })
 )
